@@ -252,6 +252,11 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
     });
   }
 
+  let creatorShare = 0;
+  if (collectedFees > 0 && creatorPublicKey) {
+    creatorShare = await calculateCreatorShare(collectedFees);
+  }
+
   const xdr = await buildWithdrawalTransaction({
     campaignWalletPublicKey: campaign.wallet_public_key,
     destinationPublicKey: destination_key,
@@ -280,7 +285,7 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
       actorUserId: req.user.userId,
       action: 'requested',
       note: null,
-      metadata: { amount, destination_key, asset_type: campaign.asset_type },
+      metadata: { amount, destination_key, asset_type: campaign.asset_type, collected_fees: collectedFees, creator_share: creatorShare },
     });
     await insertWithdrawalPendingSignatures(client, {
       campaignId: campaign_id,
@@ -292,6 +297,9 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
         destination_key,
         asset_type: campaign.asset_type,
         creator_amount: creatorAmount,
+        collected_fees: collectedFees,
+        creator_share: creatorShare,
+        creator_public_key: creatorPublicKey,
         referral_commissions: payableCommissions.map((commission) => ({
           referral_link_id: commission.referral_link_id,
           code: commission.code,
@@ -304,6 +312,8 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
     res.status(201).json({
       ...rows[0],
       creator_amount: creatorAmount,
+      collected_fees: collectedFees,
+      creator_share: creatorShare,
       referral_commissions: payableCommissions,
     });
   } catch (err) {
@@ -633,9 +643,7 @@ const platformApproveHandler = async (req, res) => {
         if (creatorRows.length > 0) {
           const creatorPublicKey = creatorRows[0].wallet_public_key;
           
-          // In production, this would initiate a separate transaction from the platform fee wallet
-          // to the creator's wallet. For now, we log it for audit purposes.
-          logger.info('Creator revenue share calculated for withdrawal', {
+          logger.info('Creator revenue share calculated and recorded for withdrawal', {
             withdrawal_id: req.params.id,
             campaign_id: updatedWithdrawalRow.campaign_id,
             collected_fees: collectedFees,

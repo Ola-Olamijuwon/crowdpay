@@ -125,3 +125,31 @@ test('withdrawal transaction with no referrals stays a single creator payment', 
   const tx = TransactionBuilder.fromXDR(xdr, NETWORK_PASSPHRASE);
   assert.equal(tx.operations.length, 1);
 });
+
+test('withdrawal transaction includes creator revenue share payment to creator public key when collected fees > 0', async () => {
+  const { buildWithdrawalTransaction, getPlatformPublicKey } = mockedStellarService();
+
+  const creatorWithdrawalDest = Keypair.random().publicKey();
+  const creatorPublicKey = Keypair.random().publicKey();
+  const platformPublicKey = getPlatformPublicKey();
+
+  const xdr = await buildWithdrawalTransaction({
+    campaignWalletPublicKey: Keypair.random().publicKey(),
+    destinationPublicKey: creatorWithdrawalDest,
+    amount: '1000.0000000',
+    asset: 'XLM',
+    collectedFees: 100, // 5% default creator share = 5.0000000
+    creatorPublicKey,
+  });
+
+  const tx = TransactionBuilder.fromXDR(xdr, NETWORK_PASSPHRASE);
+  assert.equal(tx.operations.length, 2);
+  // Main withdrawal
+  assert.equal(tx.operations[0].destination, creatorWithdrawalDest);
+  assert.equal(tx.operations[0].amount, '1000.0000000');
+  // Creator revenue share goes to creatorPublicKey, NOT platformPublicKey
+  assert.equal(tx.operations[1].destination, creatorPublicKey);
+  assert.notEqual(tx.operations[1].destination, platformPublicKey);
+  assert.equal(parseFloat(tx.operations[1].amount), 5);
+});
+

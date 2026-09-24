@@ -1256,7 +1256,7 @@ test('GET /api/contributions/finalization/:txHash returns finalized when indexed
   assert.equal(response.body.contribution.id, 'contrib-1');
 });
 
-test('POST /api/contributions includes platform_fee_amount in response and metadata', { skip: 'Stubbed route impl not matching real route - see #786' }, async () => {
+test('POST /api/contributions includes platform_fee_amount in response and metadata', async () => {
   let capturedMetadata = null;
   const app = buildApp({
     queryImpl: async (text) => {

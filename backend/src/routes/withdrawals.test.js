@@ -1627,3 +1627,125 @@ test('POST /api/withdrawals/:id/approve/platform rejects stored XDR with non-pay
   assert.equal(response.status, 422);
   assert.match(response.body.error, /only payment operations are allowed/i);
 });
+
+test('POST /api/withdrawals/request calculates and persists creator_share and collected_fees', async () => {
+  let insertedMetadata = null;
+  let builtWith = null;
+
+  const { app, cleanup } = buildApp({
+    stellarImpl: {
+      buildWithdrawalTransaction: async (params) => {
+        builtWith = params;
+        return 'xdr-creator-share';
+      },
+    },
+    queryImpl: async (text, params) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes('FROM campaigns WHERE id')) return { rows: [campaignRow()] };
+      if (text.includes('FROM withdrawal_requests') && text.includes("status = 'pending'")) return { rows: [] };
+      if (text.includes('wallet_public_key FROM users')) return { rows: [{ wallet_public_key: 'GCREATOR' }] };
+      if (text.includes('FROM contributions') && text.includes('platform_fee_amount')) {
+        return { rows: [{ total_fees: '200.0000000' }] };
+      }
+      if (text.includes('INSERT INTO withdrawal_requests')) {
+        return { rows: [{ id: 'w-1', status: 'pending', creator_signed: false, platform_signed: false, amount: '1000.0000000' }] };
+      }
+      if (text.includes('INSERT INTO stellar_transactions')) {
+        insertedMetadata = JSON.parse(params[4]);
+        return { rows: [{ id: 'stellar-1' }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/request')
+    .set('Authorization', 'Bearer token')
+    .send({
+      campaign_id: '11111111-1111-1111-1111-111111111111',
+      destination_key: VALID_DESTINATION,
+      amount: '1000.0000000',
+    });
+
+  cleanup();
+  assert.equal(response.status, 201);
+  assert.equal(response.body.collected_fees, 200);
+  assert.equal(response.body.creator_share, 10); // 5% of 200 = 10
+  assert.equal(builtWith.collectedFees, 200);
+  assert.equal(builtWith.creatorPublicKey, 'GCREATOR');
+  assert.equal(insertedMetadata.collected_fees, 200);
+  assert.equal(insertedMetadata.creator_share, 10);
+  assert.equal(insertedMetadata.creator_public_key, 'GCREATOR');
+});
+
+test('POST /api/withdrawals/:id/approve/platform finalization logs creator share and handles retry idempotently', async () => {
+  let loggedEvents = [];
+
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text, params) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes("SELECT role, is_admin FROM users WHERE id")) {
+        return { rows: [{ role: 'admin', is_admin: true }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            status: 'pending',
+            creator_signed: true,
+            platform_signed: false,
+            unsigned_xdr: 'xdr-creator-signed',
+            amount: '1000.0000000',
+            destination_key: VALID_DESTINATION,
+            campaign_status: 'active',
+            creator_id: 'creator-1',
+            requested_by: 'creator-1',
+          }],
+        };
+      }
+      if (text.includes('wallet_public_key')) {
+        return { rows: [{ wallet_public_key: 'GCREATOR_WALLET' }] };
+      }
+      if (text.includes('FROM contributions') && text.includes('platform_fee_amount')) {
+        return { rows: [{ total_fees: '100.0000000' }] };
+      }
+      if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'approved'")) {
+        return { rows: [{ id: 'w-1', status: 'approved' }] };
+      }
+      if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'submitted'")) {
+        return { rows: [{ id: 'w-1', status: 'submitted', campaign_id: '11111111-1111-1111-1111-111111111111', amount: '1000.0000000' }] };
+      }
+      if (text.includes('INSERT INTO withdrawal_approval_events')) {
+        loggedEvents.push({ action: params[2], metadata: params[4] ? JSON.parse(params[4]) : {} });
+        return { rows: [{ id: 'event-1' }] };
+      }
+      if (text.includes('SELECT metadata FROM stellar_transactions')) {
+        return { rows: [{ metadata: {} }] };
+      }
+      if (text.includes('SELECT u.email, u.name')) {
+        return { rows: [{ email: 'creator@example.com', name: 'Creator', creator_id: 'creator-1', title: 'Campaign', asset_type: 'USDC' }] };
+      }
+      if (text.includes('SELECT creator_id FROM campaigns')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/platform')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, 'submitted');
+  const creatorShareEvent = loggedEvents.find((e) => e.action === 'creator_share_calculated');
+  assert.ok(creatorShareEvent, 'creator_share_calculated event must be logged');
+  assert.equal(creatorShareEvent.metadata.collected_fees, 100);
+  assert.equal(creatorShareEvent.metadata.creator_share, 5);
+  assert.equal(creatorShareEvent.metadata.creator_public_key, 'GCREATOR_WALLET');
+});
+

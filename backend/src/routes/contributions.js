@@ -93,6 +93,7 @@ router.post(
       tx_hash: result.txHash,
       contract_mode: Boolean(campaign.escrow_contract_id),
       conversion_quote: result.conversionQuote || null,
+      platform_fee_amount: result.platformFeeAmount ?? result.platform_fee_amount ?? 0,
     });
   })
 );
@@ -149,6 +150,7 @@ router.post(
       tx_hash: result.txHash,
       contract_mode: Boolean(campaign.escrow_contract_id),
       conversion_quote: result.conversionQuote || null,
+      platform_fee_amount: result.platformFeeAmount ?? result.platform_fee_amount ?? 0,
     });
   })
 );

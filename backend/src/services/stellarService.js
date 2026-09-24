@@ -638,15 +638,11 @@ async function buildWithdrawalTransaction({
     if (creatorShare > 0) {
       builder.addOperation(
         Operation.payment({
-          destination: getPlatformKeypair().publicKey(),
+          destination: creatorPublicKey,
           asset: stellarAsset,
           amount: String(creatorShare),
         })
       );
-      
-      // Note: In production, this would need to be sent from the platform fee wallet
-      // to the creator's wallet. For now, we're including it in the transaction
-      // for audit purposes. The actual transfer would be handled separately.
     }
   }
 

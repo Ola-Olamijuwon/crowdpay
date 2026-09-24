@@ -125,6 +125,7 @@ async function submitCustodialContribution({
 
   let unsignedXdr = null;
   let signedXdr = null;
+  let platformFeeAmount = 0;
   let txHash;
 
   if (contractMode) {
@@ -185,6 +186,7 @@ async function submitCustodialContribution({
 
     unsignedXdr = preparedTransaction.unsignedXdr;
     signedXdr = preparedTransaction.signedXdr;
+    platformFeeAmount = preparedTransaction.feeAmount ?? 0;
     try {
       txHash = await submitPreparedTransaction(signedXdr);
     } catch (err) {
@@ -195,6 +197,7 @@ async function submitCustodialContribution({
 
   const metadata = {
     ...intent.flowMetadata,
+    platform_fee_amount: platformFeeAmount,
     ip_address: ipAddress || null,
     device_fingerprint: deviceFingerprint || null,
     tier_id: tierId || null,
@@ -232,6 +235,8 @@ async function submitCustodialContribution({
     conversionQuote: intent.conversionQuote,
     flowMetadata: metadata,
     contractMode,
+    platformFeeAmount,
+    platform_fee_amount: platformFeeAmount,
     destinationAmount: parseFloat(amount),
     destinationAsset: campaign.asset_type,
   };
