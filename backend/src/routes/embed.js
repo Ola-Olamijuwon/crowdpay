@@ -20,6 +20,18 @@ const { createNotification } = require('../services/notifications');
 const DESCRIPTION_TRUNCATE_LENGTH = 140;
 
 /**
+ * Simulated (database-only) embed contributions are never allowed in production.
+ * Opt in explicitly for local/test with ALLOW_EMBED_SIMULATED_CONTRIBUTIONS=true.
+ * See issue #813.
+ */
+function isEmbedSimulationAllowed() {
+  if (process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS === 'true') {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Build the Content-Security-Policy for the embed widget from environment
  * variables so dev/staging/self-hosted deployments work without hardcoding
  * api.crowdpay.com. The WebSocket protocol is derived from the backend URL
@@ -137,6 +149,9 @@ async function getCachedImpact(campaignId) {
        SELECT amount, 'embed' AS source, contributor_ip_hash AS contributor_key
          FROM embed_contributions
         WHERE campaign_id = $1
+          AND COALESCE(simulated, false) = false
+          AND stellar_tx_hash IS NOT NULL
+          AND stellar_tx_hash NOT LIKE 'tx_%'
      )
      SELECT
        COALESCE(SUM(amount), 0)::numeric AS total_raised,
@@ -500,7 +515,8 @@ router.post(
       const { rows: capCheck } = await db.query(
         `SELECT COALESCE(SUM(amount), 0)::numeric AS total
          FROM embed_contributions
-         WHERE campaign_id = $1 AND contributor_ip_hash = $2`,
+         WHERE campaign_id = $1 AND contributor_ip_hash = $2
+           AND COALESCE(simulated, false) = false`,
         [campaignId, contributorIpHash]
       );
       const alreadyContributed = Number(capCheck[0].total);
@@ -511,7 +527,20 @@ router.post(
       }
     }
 
-    // ── Atomic update ─────────────────────────────────────────────────────────
+    // ── Fail closed: no simulated funding outside explicit allow (#813) ───────
+    if (!isEmbedSimulationAllowed()) {
+      const frontendBase = (process.env.FRONTEND_URL || process.env.APP_BASE_URL || '').replace(/\/$/, '');
+      const contributionUrl = frontendBase
+        ? `${frontendBase}/campaigns/${campaignId}`
+        : `/campaigns/${campaignId}`;
+      return res.status(503).json({
+        error: 'Embed contributions require on-chain payment',
+        code: 'EMBED_PAYMENT_REQUIRED',
+        contribution_url: contributionUrl,
+      });
+    }
+
+    // ── Simulated path (dev/test only) ───────────────────────────────────────
     const { rows: campaignRows } = await db.query(
       `UPDATE campaigns
        SET raised_amount = raised_amount + $1
@@ -527,15 +556,15 @@ router.post(
     const stellarTxHash = 'tx_' + crypto.randomBytes(16).toString('hex');
 
     await db.query(
-      `INSERT INTO embed_contributions (campaign_id, embed_token_id, amount, asset, stellar_tx_hash, contributor_ip_hash)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO embed_contributions
+         (campaign_id, embed_token_id, amount, asset, stellar_tx_hash, contributor_ip_hash, simulated)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)`,
       [campaignId, activeToken.id, contribAmount, asset, stellarTxHash, contributorIpHash]
     );
 
     impactCache.delete(campaignId);
 
     const updated = campaignRows[0];
-    const totalRaised = Number(updated.raised_amount);
 
     // ── Fraud signal evaluation (non-fatal) ───────────────────────────────────
     evaluateCampaign(campaignId).catch(() => {});
@@ -554,6 +583,8 @@ router.post(
       id: campaign.id,
       raised_amount: updated.raised_amount,
       target_amount: updated.target_amount,
+      simulated: true,
+      txHash: stellarTxHash,
     });
   })
 );

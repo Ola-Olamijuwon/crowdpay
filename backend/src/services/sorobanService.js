@@ -8,11 +8,90 @@ const {
   xdr,
   Keypair,
   Operation,
+  StrKey,
 } = require('@stellar/stellar-sdk');
 const { server, networkPassphrase } = require('../config/stellar');
 const logger = require('../config/logger');
 const { TX_TIMEOUT_CONTRIBUTION_S } = require('../config/constants');
 const crypto = require('crypto');
+
+const PLACEHOLDER_CONTRACT_ID = 'created_contract_id';
+
+function looksLikeContractAddress(value) {
+  if (!value || typeof value !== 'string') return false;
+  if (value === PLACEHOLDER_CONTRACT_ID) return false;
+  try {
+    return StrKey.isValidContract(value);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract a real Soroban contract ID from a successful create-contract tx.
+ * Never returns placeholder strings — throws when metadata cannot be parsed.
+ */
+function extractCreatedContractId(result) {
+  if (!result?.resultMetaXdr) {
+    throw new Error('Contract creation succeeded but transaction metadata is missing');
+  }
+
+  const meta = xdr.TransactionMeta.fromXDR(result.resultMetaXdr, 'base64');
+  const sorobanMeta = meta.v3()?.sorobanMeta?.() || null;
+  if (!sorobanMeta) {
+    throw new Error('Contract creation succeeded but Soroban metadata is missing');
+  }
+
+  if (typeof sorobanMeta.returnValue === 'function' && sorobanMeta.returnValue()) {
+    try {
+      const addr = Address.fromScVal(sorobanMeta.returnValue());
+      const contractId = addr.toString();
+      if (looksLikeContractAddress(contractId)) {
+        return contractId;
+      }
+    } catch (err) {
+      logger.warn?.('extractCreatedContractId: returnValue was not an Address', {
+        error: err.message,
+      });
+    }
+
+    try {
+      const native = scValToNative(sorobanMeta.returnValue());
+      if (looksLikeContractAddress(native)) {
+        return native;
+      }
+    } catch (err) {
+      logger.warn?.('extractCreatedContractId: returnValue scValToNative failed', {
+        error: err.message,
+      });
+    }
+  }
+
+  const created =
+    typeof sorobanMeta.createdContracts === 'function' ? sorobanMeta.createdContracts() : null;
+  if (created && created.length > 0) {
+    const entry = created[0];
+    let bytes;
+    if (Buffer.isBuffer(entry)) {
+      bytes = entry;
+    } else if (typeof entry?.contractId === 'function') {
+      const cid = entry.contractId();
+      bytes = Buffer.isBuffer(cid) ? cid : Buffer.from(cid);
+    } else if (entry?.length === 32) {
+      bytes = Buffer.from(entry);
+    }
+    if (bytes && bytes.length === 32) {
+      const contractId = StrKey.encodeContract(bytes);
+      if (looksLikeContractAddress(contractId)) {
+        return contractId;
+      }
+    }
+  }
+
+  throw new Error(
+    'Contract creation succeeded but created contract ID could not be parsed from metadata'
+  );
+}
 
 async function simulateAndPrepare(tx) {
   const simulation = await server.simulateTransaction(tx);
@@ -335,26 +414,24 @@ async function buildUnsignedEscrowDeposit({ contractId, fromAddress, amount }) {
 }
 
 /**
- * Contract-mode deposits require Soroban to actually be enabled — when it's
- * off, `deployCampaignContracts` still stamps a mock (non-real) contract id
- * on every campaign, so gating on `escrow_contract_id` alone would try to
- * invoke a fake contract. See issue #710.
+ * Contract-mode deposits require Soroban to actually be enabled and a real
+ * (StrKey-valid) escrow contract ID. Mock/placeholder IDs are never eligible.
+ * See issues #710 and #809.
  */
 function isContractDepositEligible(campaign) {
-  return process.env.SOROBAN_ENABLED === 'true' && !!campaign?.escrow_contract_id;
+  return (
+    process.env.SOROBAN_ENABLED === 'true' &&
+    looksLikeContractAddress(campaign?.escrow_contract_id)
+  );
 }
 
 /**
  * Returns true if the given escrow contract ID is a real deployed Soroban
- * contract (not a mock ID generated when SOROBAN_ENABLED=false).
- * 
- * Mock IDs are random hex strings starting with 'C', but they're only stamped
- * when SOROBAN_ENABLED is not 'true'. Real contract IDs are also 'C...' but
- * they're deployed on-chain.
+ * contract address (valid StrKey contract ID) and Soroban is enabled.
+ * Rejects null, placeholder, and malformed IDs.
  */
 function isRealSorobanContract(escrowContractId) {
-  if (!escrowContractId) return false;
-  return process.env.SOROBAN_ENABLED === 'true';
+  return process.env.SOROBAN_ENABLED === 'true' && looksLikeContractAddress(escrowContractId);
 }
 
 async function requestRefund({ contractId, contributorAddress, signerSecret }) {
@@ -456,18 +533,10 @@ async function createContractFromWasmHash({ wasmHash, signerSecret, address }) {
   const result = await server.submitTransaction(tx);
 
   if (result.status === 'SUCCESS') {
-    if (result.resultMetaXdr) {
-      const meta = xdr.TransactionMeta.fromXDR(result.resultMetaXdr, 'base64');
-      const sorobanMeta = meta.v3().sorobanMeta();
-      const created = sorobanMeta && typeof sorobanMeta.createdContracts === 'function' ? sorobanMeta.createdContracts() : null;
-      if (created && created.length > 0) {
-        return {
-          contractId: created[0].contractId().toString('hex'),
-          txHash: result.hash || null,
-        };
-      }
-    }
-    return { contractId: 'created_contract_id', txHash: result.hash || null };
+    return {
+      contractId: extractCreatedContractId(result),
+      txHash: result.hash || null,
+    };
   }
   throw new Error(`Contract creation failed: ${result.status}`);
 }
@@ -519,8 +588,13 @@ async function refund(contractId, contributorPublicKey) {
 
 /**
  * Deploy and initialize both escrow and milestones contracts for a campaign.
- * Uses pre-deployed contract IDs from env when set, otherwise deploys new instances.
- * Falls back to mock IDs if SOROBAN_ENABLED is not true.
+ *
+ * Modes:
+ *   env      — both ESCROW_CONTRACT_ID and MILESTONES_CONTRACT_ID set
+ *   deploy   — SOROBAN_ENABLED=true with ESCROW_WASM_HASH + MILESTONES_WASM_HASH
+ *   disabled — Soroban off: returns null IDs (never persists mock C… IDs)
+ *
+ * Escrow admin is always the milestones contract (cross-contract releases).
  */
 async function deployCampaignContracts({
   creatorPublicKey,
@@ -530,34 +604,44 @@ async function deployCampaignContracts({
   deadlineUnix,
   assetContractAddress,
   platformFeeBps,
-  milestones,
+  milestones: milestoneDefs,
   signerSecret,
 }) {
   const envEscrowId = process.env.ESCROW_CONTRACT_ID || null;
   const envMilestonesId = process.env.MILESTONES_CONTRACT_ID || null;
 
   if (envEscrowId || envMilestonesId) {
-    if (envEscrowId) {
-      await initializeEscrow({
-        contractId: envEscrowId,
-        adminAddress: creatorPublicKey,
-        campaignId,
-        target: targetAmount,
-        deadline: deadlineUnix,
-        assetContractAddress,
-        platformFeeBps,
-        platformFeeRecipientAddress: platformPublicKey,
-        signerSecret,
-      });
+    if (!envEscrowId || !envMilestonesId) {
+      throw new Error(
+        'Both ESCROW_CONTRACT_ID and MILESTONES_CONTRACT_ID must be set together. Partial preconfigured IDs are not allowed.'
+      );
+    }
+    if (!looksLikeContractAddress(envEscrowId) || !looksLikeContractAddress(envMilestonesId)) {
+      throw new Error(
+        'ESCROW_CONTRACT_ID and MILESTONES_CONTRACT_ID must be valid Soroban contract addresses'
+      );
     }
 
-    if (envMilestonesId && milestones && milestones.length) {
+    // Escrow admin MUST be the milestones contract for approve_milestone → release.
+    await initializeEscrow({
+      contractId: envEscrowId,
+      adminAddress: envMilestonesId,
+      campaignId,
+      target: targetAmount,
+      deadline: deadlineUnix,
+      assetContractAddress,
+      platformFeeBps,
+      platformFeeRecipientAddress: platformPublicKey,
+      signerSecret,
+    });
+
+    if (milestoneDefs && milestoneDefs.length) {
       await initializeMilestones({
         contractId: envMilestonesId,
         creatorAddress: creatorPublicKey,
         platformAddress: platformPublicKey,
         escrowContractId: envEscrowId,
-        milestones,
+        milestones: milestoneDefs,
         signerSecret,
       });
     }
@@ -570,14 +654,10 @@ async function deployCampaignContracts({
   const milestonesWasmHash = process.env.MILESTONES_WASM_HASH;
 
   if (!sorobanEnabled) {
-    const mockEscrowId = 'C' + crypto.randomBytes(24).toString('hex').toUpperCase();
-    const mockMilestonesId = 'C' + crypto.randomBytes(24).toString('hex').toUpperCase();
-    logger.info('Soroban disabled (SOROBAN_ENABLED != true), using mock contract IDs for development', {
-      mockEscrowId,
-      mockMilestonesId,
-      hint: 'Set SOROBAN_ENABLED=true and configure ESCROW_CONTRACT_ID/MILESTONES_CONTRACT_ID or ESCROW_WASM_HASH/MILESTONES_WASM_HASH for real contracts',
-    });
-    return { escrowContractId: mockEscrowId, milestonesContractId: mockMilestonesId };
+    logger.info(
+      'Soroban disabled (SOROBAN_ENABLED != true); returning null contract IDs (classic wallet path)'
+    );
+    return { escrowContractId: null, milestonesContractId: null };
   }
 
   if (!escrowWasmHash || !milestonesWasmHash) {
@@ -588,22 +668,29 @@ async function deployCampaignContracts({
 
   try {
     logger.info('Deploying escrow contract instance...');
-    const escrow = await createContractFromWasmHash({
+    const escrowDeploy = await createContractFromWasmHash({
       wasmHash: escrowWasmHash,
       signerSecret,
     });
 
     logger.info('Deploying milestones contract instance...');
-    const milestones = await createContractFromWasmHash({
+    const milestonesDeploy = await createContractFromWasmHash({
       wasmHash: milestonesWasmHash,
       signerSecret,
     });
 
+    if (
+      !looksLikeContractAddress(escrowDeploy.contractId) ||
+      !looksLikeContractAddress(milestonesDeploy.contractId)
+    ) {
+      throw new Error('Deployed contract IDs failed validation');
+    }
+
     logger.info('Initializing escrow contract...');
     await initializeEscrow({
-      contractId: escrow.contractId,
-      adminAddress: milestones.contractId,
-      campaignId: parseInt(campaignId.replace(/-/g, '').slice(0, 8), 16) || 1,
+      contractId: escrowDeploy.contractId,
+      adminAddress: milestonesDeploy.contractId,
+      campaignId: parseInt(String(campaignId).replace(/-/g, '').slice(0, 8), 16) || 1,
       target: targetAmount,
       deadline: deadlineUnix,
       assetContractAddress,
@@ -614,18 +701,18 @@ async function deployCampaignContracts({
 
     logger.info('Initializing milestones contract...');
     await initializeMilestones({
-      contractId: milestones.contractId,
+      contractId: milestonesDeploy.contractId,
       creatorAddress: creatorPublicKey,
       platformAddress: platformPublicKey,
-      escrowContractId: escrow.contractId,
-      milestones,
+      escrowContractId: escrowDeploy.contractId,
+      milestones: milestoneDefs,
       signerSecret,
     });
 
     return {
-      escrowContractId: escrow.contractId,
-      milestonesContractId: milestones.contractId,
-      deploymentTxHash: escrow.txHash,
+      escrowContractId: escrowDeploy.contractId,
+      milestonesContractId: milestonesDeploy.contractId,
+      deploymentTxHash: escrowDeploy.txHash,
     };
   } catch (err) {
     logger.error('Soroban contract deployment failed', { error: err.message });
@@ -987,4 +1074,6 @@ module.exports = {
   deployMilestonesV2Contract,
   deployMigrationContract,
   runMigration,
+  looksLikeContractAddress,
+  extractCreatedContractId,
 };

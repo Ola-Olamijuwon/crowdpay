@@ -22,7 +22,9 @@ function devKycSession({ user }) {
 
 async function createPersonaInquiry({ user }) {
   if (!process.env.PERSONA_API_KEY || !process.env.PERSONA_TEMPLATE_ID) {
-    return devKycSession({ user });
+    throw new Error(
+      'Persona KYC is not configured. Set PERSONA_API_KEY and PERSONA_TEMPLATE_ID, or set KYC_PROVIDER=dev for local development.'
+    );
   }
 
   const response = await fetch('https://withpersona.com/api/v1/inquiries', {
@@ -72,11 +74,17 @@ async function createPersonaInquiry({ user }) {
 async function createKycSession({ user }) {
   const provider = String(process.env.KYC_PROVIDER || 'persona').toLowerCase();
 
+  if (provider === 'dev') {
+    return devKycSession({ user });
+  }
+
   if (provider === 'persona') {
     return createPersonaInquiry({ user });
   }
 
-  return devKycSession({ user });
+  throw new Error(
+    `Unsupported KYC_PROVIDER "${provider}". Use "persona" or "dev".`
+  );
 }
 
 const VERIFICATION_TIER_LIMITS = {

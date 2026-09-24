@@ -203,12 +203,17 @@ async function registerIdentity(publicKey, userId) {
     ]);
     contractRegisteredAt = new Date();
   } catch (err) {
-    // Log but do not hard-fail: the DB record is the source of truth for the
-    // application layer.  The contract call can be retried later.
     logger.warn('contributorIdentityService.registerIdentity: contract call failed', {
       publicKey,
       error: err.message,
     });
+    const fail = new Error(
+      'Contributor identity could not be registered on-chain. Try again when Soroban is available.'
+    );
+    fail.statusCode = 503;
+    fail.code = 'IDENTITY_UNAVAILABLE';
+    fail.cause = err;
+    throw fail;
   }
 
   const { rows } = await db.query(
@@ -266,6 +271,20 @@ async function issueKycAttestation(subjectPublicKey, userId, kycLevel, personaIn
       attestationType,
       error: err.message,
     });
+    const fail = new Error(
+      'KYC attestation could not be confirmed on-chain. Try again when Soroban is available.'
+    );
+    fail.statusCode = 503;
+    fail.code = 'ATTESTATION_UNAVAILABLE';
+    fail.cause = err;
+    throw fail;
+  }
+
+  if (!onChainTxHash) {
+    const fail = new Error('KYC attestation missing on-chain transaction hash');
+    fail.statusCode = 503;
+    fail.code = 'ATTESTATION_UNAVAILABLE';
+    throw fail;
   }
 
   const { rows } = await db.query(
@@ -467,12 +486,13 @@ async function getContributorProfile(publicKey) {
  *   - The contract's has_attestation returns true.
  */
 async function verifyAttestation(publicKey, attestationType) {
-  // DB check
+  // DB check — only rows with a confirmed on-chain tx hash count as verified candidates
   const { rows } = await db.query(
     `SELECT expires_at FROM kyc_attestations
      WHERE public_key = $1
        AND attestation_type = $2::kyc_attestation_type
        AND revoked_at IS NULL
+       AND on_chain_tx_hash IS NOT NULL
        AND (expires_at IS NULL OR expires_at > NOW())
      ORDER BY issued_at DESC
      LIMIT 1`,
@@ -483,7 +503,7 @@ async function verifyAttestation(publicKey, attestationType) {
     return { verified: false, expiresAt: null };
   }
 
-  // On-chain check
+  // On-chain check — RPC/config failures fail closed (never treat as verified)
   let onChain = false;
   try {
     onChain = await contractRead('has_attestation', [
@@ -496,9 +516,7 @@ async function verifyAttestation(publicKey, attestationType) {
       attestationType,
       error: err.message,
     });
-    // Fall back to DB-only result to avoid blocking legitimate contributors
-    // when the RPC is temporarily unavailable.
-    onChain = true;
+    return { verified: false, expiresAt: null, unavailable: true };
   }
 
   return {

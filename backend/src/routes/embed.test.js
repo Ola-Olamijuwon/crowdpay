@@ -278,3 +278,57 @@ test('POST contribute accepts valid contribution to active campaign with all che
   assert.equal(res.body.amount, 50);
   assert.ok(res.body.txHash);
 });
+
+test('POST contribute fails closed without ALLOW_EMBED_SIMULATED_CONTRIBUTIONS (#813)', async () => {
+  const prev = process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS;
+  delete process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS;
+
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  let updatedRaised = false;
+  let insertedEmbed = false;
+  const queryImpl = buildContributeQueryImpl({ status: 'active' });
+  const wrapped = async (text, params) => {
+    if (text.includes('UPDATE campaigns') && text.includes('raised_amount')) {
+      updatedRaised = true;
+    }
+    if (text.includes('INSERT INTO embed_contributions')) {
+      insertedEmbed = true;
+    }
+    return queryImpl(text, params);
+  };
+
+  const app = buildApp(wrapped);
+  const res = await request(app)
+    .post(`/api/embed/campaigns/${CAMPAIGN_ID}/contribute`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .send({ amount: 50, asset: 'USDC' });
+
+  assert.equal(res.status, 503);
+  assert.equal(res.body.code, 'EMBED_PAYMENT_REQUIRED');
+  assert.equal(updatedRaised, false);
+  assert.equal(insertedEmbed, false);
+
+  if (prev === undefined) delete process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS;
+  else process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS = prev;
+});
+
+test('POST contribute allows simulation when ALLOW_EMBED_SIMULATED_CONTRIBUTIONS=true (#813)', async () => {
+  const prev = process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS;
+  process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS = 'true';
+
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const app = buildApp(buildContributeQueryImpl({ status: 'active' }));
+
+  const res = await request(app)
+    .post(`/api/embed/campaigns/${CAMPAIGN_ID}/contribute`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .send({ amount: 50, asset: 'USDC' });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.simulated, true);
+  assert.ok(res.body.txHash);
+  assert.ok(String(res.body.txHash).startsWith('tx_'));
+
+  if (prev === undefined) delete process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS;
+  else process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS = prev;
+});

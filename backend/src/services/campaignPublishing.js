@@ -64,11 +64,23 @@ async function publishDraftCampaign(campaignId) {
     signerSecret: process.env.PLATFORM_SECRET_KEY,
   });
 
+  // When Soroban is enabled, refuse to activate without verified contract IDs.
+  if (
+    process.env.SOROBAN_ENABLED === 'true' &&
+    (!escrowContractId || !milestonesContractId)
+  ) {
+    throw new CampaignNotPublishableError(
+      'Soroban is enabled but campaign contract deployment returned no contract IDs'
+    );
+  }
+
   const { rows: updated } = await db.query(
     `UPDATE campaigns
      SET wallet_public_key = $1, escrow_contract_id = $2, milestones_contract_id = $3,
          contract_address = $2, contract_deployed_at = NOW(), platform_fee_bps = $4,
-         status = 'active', scheduled_publish_at = NULL
+         status = 'active', scheduled_publish_at = NULL,
+         contract_deployment_status = 'deployed', contract_deployment_error = NULL,
+         last_deployment_attempt_at = NOW()
      WHERE id = $5 AND status = 'draft'
      RETURNING *`,
     [wallet.publicKey, escrowContractId, milestonesContractId, platformFeeBps, campaignId]

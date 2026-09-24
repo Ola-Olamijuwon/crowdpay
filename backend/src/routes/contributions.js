@@ -10,9 +10,24 @@ const { resolveReferralLink } = require('../services/referral');
 const { getReferralCodeFromRequest } = require('../services/referralService');
 const { reserveTierSlot } = require('../services/rewardTierService');
 const { assertUserKycVerified } = require('../services/kycService');
+const { assertContributorMeetsRequirements } = require('../services/contributorIdentityService');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const asyncHandler = require('../utils/asyncHandler');
+
+function mapContributionGateError(err, res) {
+  if (err.statusCode === 403 && err.code === 'CONTRIBUTOR_REQUIREMENTS_NOT_MET') {
+    return res.status(403).json({
+      error: err.message,
+      code: err.code,
+      missing: err.missing || [],
+    });
+  }
+  if (err.statusCode === 503 && (err.code === 'IDENTITY_UNAVAILABLE' || err.code === 'ATTESTATION_UNAVAILABLE')) {
+    return res.status(503).json({ error: err.message, code: err.code });
+  }
+  throw err;
+}
 
 async function resolveContributorWallet(req) {
   if (req.user?.walletPublicKey && req.user?.walletSecretEncrypted) {
@@ -62,6 +77,12 @@ router.post(
     }
 
     const { walletPublicKey, walletSecretEncrypted } = await resolveContributorWallet(req);
+
+    try {
+      await assertContributorMeetsRequirements(walletPublicKey, campaign_id);
+    } catch (err) {
+      return mapContributionGateError(err, res);
+    }
 
     const referralCode = getReferralCodeFromRequest(req);
     let referralLink = null;
@@ -151,6 +172,20 @@ router.post(
     const user = userRows[0];
     if (!user || !user.wallet_public_key) {
       return res.status(400).json({ error: 'Contributor wallet not found' });
+    }
+
+    try {
+      await assertUserKycVerified(userId);
+      await assertContributorMeetsRequirements(user.wallet_public_key, campaign_id);
+    } catch (err) {
+      if (err.code === 'KYC_REQUIRED' || err.statusCode === 403) {
+        return res.status(err.statusCode || 403).json({
+          error: err.message,
+          code: err.code,
+          missing: err.missing || undefined,
+        });
+      }
+      return mapContributionGateError(err, res);
     }
 
     const result = await contributionService.submitCustodialContribution({

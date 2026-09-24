@@ -1695,10 +1695,11 @@ router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignVal
   // ASSET_CONTRACT_ADDRESS in env and populate it from the Stellar asset contract.
   const assetContractAddress = process.env.USDC_CONTRACT_ADDRESS || process.env.USDC_ISSUER;
 
-  let escrowContractId;
-  let milestonesContractId;
+  let escrowContractId = null;
+  let milestonesContractId = null;
   let contractDeploymentStatus;
   let contractDeploymentError = null;
+  let campaignStatus = 'active';
   try {
     ({ escrowContractId, milestonesContractId } = await deployCampaignContracts({
       creatorPublicKey,
@@ -1719,6 +1720,10 @@ router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignVal
     });
     contractDeploymentStatus = 'failed';
     contractDeploymentError = err.message;
+    // Never activate a campaign with missing/failed contract wiring (#809).
+    campaignStatus = 'draft';
+    escrowContractId = null;
+    milestonesContractId = null;
 
     Sentry.withScope((scope) => {
       scope.setLevel('error');
@@ -1753,14 +1758,16 @@ router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignVal
          (title, description, target_amount, asset_type, wallet_public_key, creator_id, deadline, 
           min_contribution, max_contribution, escrow_contract_id, milestones_contract_id, platform_fee_bps,
           contract_address, contract_deployed_at, content_fingerprint, is_flagged_duplicate,
-          contract_deployment_status, contract_deployment_error, last_deployment_attempt_at, template_id, category, country)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+          contract_deployment_status, contract_deployment_error, last_deployment_attempt_at, template_id, category, country,
+          status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
        RETURNING *`,
       [title, description, target_amount, asset_type, walletPublicKey, req.user.userId, deadline, 
        min_contribution || null, max_contribution || null, escrowContractId, milestonesContractId, platformFeeBps,
        contractAddress, contractDeploymentStatus === 'deployed' ? new Date() : null,
        contentFingerprint, isFlaggedDuplicate,
-       contractDeploymentStatus, contractDeploymentError, new Date(), template_id || null, category || null, normalizedCountry]
+       contractDeploymentStatus, contractDeploymentError, new Date(), template_id || null, category || null, normalizedCountry,
+       campaignStatus]
     );
     campaign = rows[0];
 
