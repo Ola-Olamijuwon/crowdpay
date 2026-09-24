@@ -684,8 +684,30 @@ const proxyquire = require('proxyquire').noCallThru();
       );
     });
 
-    test('createContractFromWasmHash parses created contract ID on success', async () => {
+    test('createContractFromWasmHash throws when created contract ID cannot be parsed (#809)', async () => {
       const metaBase64 = createMockMetaXdr(xdr.ScVal.scvVoid());
+
+      const service = buildService({
+        submitTransaction: async () => ({
+          status: 'SUCCESS',
+          hash: 'txhash123',
+          resultMetaXdr: metaBase64,
+        }),
+      });
+
+      await assert.rejects(
+        () => service.createContractFromWasmHash({
+          wasmHash: TEST_WASM_HASH,
+          signerSecret: TEST_SECRET,
+        }),
+        /could not be parsed from metadata/
+      );
+    });
+
+    test('createContractFromWasmHash parses created contract ID from return Address (#809)', async () => {
+      const { Address } = require('@stellar/stellar-sdk');
+      const returnScVal = Address.fromString(TEST_CONTRACT_ID).toScVal();
+      const metaBase64 = createMockMetaXdr(returnScVal);
 
       const service = buildService({
         submitTransaction: async () => ({
@@ -700,7 +722,7 @@ const proxyquire = require('proxyquire').noCallThru();
         signerSecret: TEST_SECRET,
       });
 
-      assert.ok(res.contractId);
+      assert.equal(res.contractId, TEST_CONTRACT_ID);
       assert.equal(res.txHash, 'txhash123');
     });
 
@@ -760,7 +782,7 @@ const proxyquire = require('proxyquire').noCallThru();
       delete process.env.MILESTONES_CONTRACT_ID;
     });
 
-    test('deployCampaignContracts returns mock contract IDs if SOROBAN_ENABLED is false', async () => {
+    test('deployCampaignContracts returns null contract IDs if SOROBAN_ENABLED is false', async () => {
       delete process.env.ESCROW_CONTRACT_ID;
       delete process.env.MILESTONES_CONTRACT_ID;
       process.env.SOROBAN_ENABLED = 'false';
@@ -778,8 +800,8 @@ const proxyquire = require('proxyquire').noCallThru();
         signerSecret: TEST_SECRET,
       });
 
-      assert.ok(result.escrowContractId.startsWith('C'));
-      assert.ok(result.milestonesContractId.startsWith('C'));
+      assert.equal(result.escrowContractId, null);
+      assert.equal(result.milestonesContractId, null);
     });
 
     test('deployCampaignContracts throws wrapped error on deployment failure', async () => {
@@ -815,8 +837,10 @@ const proxyquire = require('proxyquire').noCallThru();
       delete process.env.MILESTONES_WASM_HASH;
     });
 
-    test('initializeCampaignContract returns escrow & milestone contract addresses', async () => {
+    test('initializeCampaignContract returns null contract addresses when Soroban is disabled', async () => {
       process.env.SOROBAN_ENABLED = 'false';
+      delete process.env.ESCROW_CONTRACT_ID;
+      delete process.env.MILESTONES_CONTRACT_ID;
       const service = buildService();
 
       const res = await service.initializeCampaignContract({
@@ -831,9 +855,9 @@ const proxyquire = require('proxyquire').noCallThru();
         signerSecret: TEST_SECRET,
       });
 
-      assert.ok(res.contractAddress);
-      assert.ok(res.escrowContractId);
-      assert.ok(res.milestonesContractId);
+      assert.equal(res.contractAddress, null);
+      assert.equal(res.escrowContractId, null);
+      assert.equal(res.milestonesContractId, null);
     });
 
     test('releaseMilestone & triggerRefund handle success and errors', async () => {

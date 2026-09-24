@@ -99,6 +99,14 @@ router.post('/incoming/:id', incomingWebhookLimiter, express.raw({ type: 'applic
   }
 });
 
+// Public webhook ingress is POST-only. Reject every other method (GET/HEAD/
+// DELETE/...) with an explicit 405 instead of letting it fall through to the
+// 404 handler — senders and scanners probing during setup get a clearer answer (#799).
+// Registered after the POST handler above so valid POSTs are never affected.
+router.all('/incoming/:id', (req, res) => {
+  res.status(405).set('Allow', 'POST').json({ error: 'Method not allowed' });
+});
+
 router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const { rows } = await db.query(
     `SELECT id, url, events,

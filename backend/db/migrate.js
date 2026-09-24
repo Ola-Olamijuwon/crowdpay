@@ -19,6 +19,28 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const COMMAND = process.argv[2] || 'up';
 
+// When running after `psql -f db/schema.sql` (the `migrate:fresh` flow), a few
+// early migrations duplicate tables/columns that schema.sql already provides
+// (e.g. 20260401 creates users/campaigns/contributions). Those objects are
+// part of the canonical base schema snapshot and their final shape lives in
+// schema.sql, so re-creating them is unnecessary and would abort the run.
+//
+// `--bootstrap-schema` (or MIGRATE_BOOTSTRAP_SCHEMA=1) makes `up` skip a
+// migration whose objects already exist (Postgres "duplicate_*" error codes)
+// AFTER a full schema.sql bootstrap — never on a migrations-only install
+// (`npm run migrate` stays strict). Already-applied migrations are never
+// edited, so deployed environments keep their recorded hashes intact.
+const BOOTSTRAP_SCHEMA =
+  process.argv.includes('--bootstrap-schema') || process.env.MIGRATE_BOOTSTRAP_SCHEMA === '1';
+
+// PostgreSQL ERRCODEs for "this already exists" failures.
+const ALREADY_CREATED_CODES = new Set([
+  '42P07', // duplicate_table
+  '42701', // duplicate_column
+  '42P04', // duplicate_object
+  '42710', // duplicate_object (constraints/indexes on existing objects)
+]);
+
 async function runUp() {
   const client = await pool.connect();
   try {
@@ -46,15 +68,37 @@ async function runUp() {
       }
       const sql = readUpSql(file);
       const hash = fileHashFor(file);
-      console.log(`[migrate] Applying: ${file}`);
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query(
-        'INSERT INTO schema_migrations (filename, file_hash) VALUES ($1, $2)',
-        [file, hash]
-      );
-      await client.query('COMMIT');
-      count++;
+      try {
+        console.log(`[migrate] Applying: ${file}`);
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query(
+          'INSERT INTO schema_migrations (filename, file_hash) VALUES ($1, $2)',
+          [file, hash]
+        );
+        await client.query('COMMIT');
+        count++;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (BOOTSTRAP_SCHEMA && err.code && ALREADY_CREATED_CODES.has(err.code)) {
+          // schema.sql already provides the canonical version of this object.
+          // Record the migration as applied so later incremental migrations
+          // (which assume it ran) proceed normally (#800).
+          console.log(
+            `[migrate] Skipping '${file}': objects already present via schema.sql ` +
+              `(${err.code}: ${err.message})`
+          );
+          await client.query('BEGIN');
+          await client.query(
+            'INSERT INTO schema_migrations (filename, file_hash) VALUES ($1, $2)',
+            [file, hash]
+          );
+          await client.query('COMMIT');
+          count++;
+          continue;
+        }
+        throw err;
+      }
     }
 
     console.log(`[migrate] Done. ${count} migration(s) applied.`);
@@ -167,7 +211,9 @@ async function main() {
     }
     default:
       console.error(`Unknown command: ${COMMAND}`);
-      console.error('Usage: node db/migrate.js [up|status|down [count]]');
+      console.error('Usage: node db/migrate.js [up|status|down [count]] [--bootstrap-schema]');
+      console.error('  --bootstrap-schema  skip migrations whose objects already exist after');
+      console.error('                      `psql -f db/schema.sql` (used by npm run migrate:fresh)');
       process.exitCode = 1;
       await pool.end();
   }

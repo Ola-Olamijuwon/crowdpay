@@ -318,6 +318,13 @@ export default function Developer() {
         }
         headers.Authorization = `Bearer ${explorerApiKey}`;
       }
+      // The API playground runs in the browser, so same-origin mutating calls
+      // must echo the `cp_csrf` cookie or the csrfProtection middleware 403s
+      // them (#801).
+      if (selectedEndpoint.method !== 'GET' && typeof document !== 'undefined') {
+        const csrfMatch = document.cookie.match(/(?:^|; )cp_csrf=([^;]*)/);
+        if (csrfMatch) headers['x-csrf-token'] = decodeURIComponent(csrfMatch[1]);
+      }
       const options = {
         method: selectedEndpoint.method,
         headers:

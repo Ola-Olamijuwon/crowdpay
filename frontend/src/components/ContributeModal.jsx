@@ -24,6 +24,24 @@ function friendlyQuoteError(err) {
   return err.message || 'Could not load a quote.';
 }
 
+/** Render normalized Stellar asset objects (or plain codes) as route labels (#688). */
+function pathLabels(path) {
+  if (!Array.isArray(path)) return [];
+  return path.map((asset) =>
+    typeof asset === 'string'
+      ? asset
+      : asset?.asset_type === 'native'
+        ? 'XLM'
+        : asset?.asset_code || asset?.asset_type || ''
+  );
+}
+
+function routeLabel(p, sendAsset, destAsset) {
+  const hops = pathLabels(p.path);
+  const route = hops.length ? ` → ${hops.join(' → ')}` : '';
+  return `${Number(p.source_amount).toLocaleString()} ${sendAsset}${route} → ${destAsset}`;
+}
+
 function friendlyContributeError(err) {
   if (err.status === 422) {
     return err.message || 'Conversion failed. Try another amount or asset.';
@@ -117,6 +135,9 @@ export default function ContributeModal({
   const [error, setError] = useState('');
   const [quoteError, setQuoteError] = useState('');
   const [quote, setQuote] = useState(null);
+  const [rankedPaths, setRankedPaths] = useState([]);
+  const [selectedPathIndex, setSelectedPathIndex] = useState(0);
+  const [previewToken, setPreviewToken] = useState(null);
   const [phase, setPhase] = useState('form');
   const [result, setResult] = useState(null);
   const [feeBps, setFeeBps] = useState(0);
@@ -217,22 +238,46 @@ export default function ContributeModal({
     setQuoteLoading(true);
     setQuoteError('');
     try {
-      const q = await api.quoteContribution(
-        {
-          send_asset: effectiveSendAsset,
-          dest_asset: campaign.asset_type,
-          dest_amount: destAmount,
-        },
-        token
-      );
-      setQuote(q);
+      const q = await api.quoteContribution(campaign.id, {
+        send_asset: effectiveSendAsset,
+        dest_amount: destAmount,
+      });
+      if (q.direct) {
+        setQuote(null);
+        setQuoteError('');
+        return;
+      }
+      const paths = Array.isArray(q.ranked_paths) ? q.ranked_paths : [];
+      setRankedPaths(paths);
+      setPreviewToken(q.preview_token || null);
+      setSelectedPathIndex(0);
+      if (paths.length) {
+        const best = paths[0];
+        setQuote({ ...q, ...best, preview_token: q.preview_token });
+      } else {
+        setQuote({ ...q, preview_token: q.preview_token });
+      }
     } catch (err) {
       setQuote(null);
       setQuoteError(friendlyQuoteError(err));
     } finally {
       setQuoteLoading(false);
     }
-  }, [isPathPayment, destAmount, effectiveSendAsset, campaign.asset_type, token]);
+  }, [campaign.id, isPathPayment, destAmount, effectiveSendAsset]);
+
+  const handleSelectPath = (index) => {
+    const selected = rankedPaths[index];
+    if (!selected) return;
+    setSelectedPathIndex(index);
+    if (quote) {
+      setQuote({
+        ...quote,
+        source_amount: selected.source_amount,
+        max_send_amount: selected.max_send_amount,
+        path: selected.path,
+      });
+    }
+  };
 
   useEffect(() => {
     if (!isPathPayment) {
@@ -392,6 +437,9 @@ export default function ContributeModal({
         display_name: displayName.trim() || undefined,
         device_fingerprint: device_fingerprint || undefined,
         idempotency_key: activeSubmissionKeyRef.current,
+        ...(isPathPayment && previewToken
+          ? { preview_token: previewToken, selected_path_index: selectedPathIndex }
+          : {}),
       },
       referralQuery
     );
@@ -435,6 +483,9 @@ export default function ContributeModal({
         display_name: displayName.trim() || undefined,
         device_fingerprint: device_fingerprint || undefined,
         idempotency_key: activeSubmissionKeyRef.current,
+        ...(isPathPayment && previewToken
+          ? { preview_token: previewToken, selected_path_index: selectedPathIndex }
+          : {}),
       },
       referralQuery
     );
@@ -476,14 +527,11 @@ export default function ContributeModal({
     }
 
     setLoadingLabel('Submitting signed transaction…');
-    return api.submitSignedContribution(
-      {
-        prepare_token: prepared.prepare_token,
-        signed_xdr: signed.signedTxXdr,
-        idempotency_key: activeSubmissionKeyRef.current,
-      },
-      token
-    );
+    return api.submitSignedContribution({
+      prepare_token: prepared.prepare_token,
+      signed_xdr: signed.signedTxXdr,
+      idempotency_key: activeSubmissionKeyRef.current,
+    });
   }
 
   async function submitWithAnchor() {
@@ -953,14 +1001,40 @@ export default function ContributeModal({
                       <div style={{ fontSize: '0.875rem', lineHeight: 1.45 }}>
                         Up to <strong>{quote.max_send_amount}</strong> {effectiveSendAsset}{' '}
                         (includes a small slippage buffer).
-                        {Array.isArray(quote.path) && quote.path.length > 0 && (
+                        {pathLabels(quote.path).length > 0 && (
                           <>
                             {' '}
-                            Route: {effectiveSendAsset} → {quote.path.join(' → ')} →{' '}
+                            Route: {effectiveSendAsset} → {pathLabels(quote.path).join(' → ')} →{' '}
                             {campaign.asset_type}
                           </>
                         )}
                       </div>
+                    </div>
+                  )}
+                  {!quoteLoading && quote && rankedPaths.length > 1 && (
+                    <div
+                      className="form-stack"
+                      style={{ marginTop: '0.5rem' }}
+                    >
+                      <label
+                        className="label-strong"
+                        htmlFor="contrib-path-select"
+                        style={{ display: 'block', marginBottom: '0.3rem' }}
+                      >
+                        Conversion route
+                      </label>
+                      <select
+                        id="contrib-path-select"
+                        value={selectedPathIndex}
+                        onChange={(e) => handleSelectPath(Number(e.target.value))}
+                        style={{ width: '100%' }}
+                      >
+                        {rankedPaths.map((p) => (
+                          <option key={p.index} value={p.index}>
+                            {routeLabel(p, effectiveSendAsset, campaign.asset_type)}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   )}
                   {!quoteLoading && quoteError && (

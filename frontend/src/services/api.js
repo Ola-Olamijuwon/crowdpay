@@ -15,6 +15,32 @@ export const apiClient = axios.create({
   withCredentials: true,
 });
 
+// --- CSRF (double-submit cookie) ---
+// The server issues a readable `cp_csrf` cookie (set on the first GET) and the
+// csrfProtection middleware requires every state-changing request to echo it in
+// the `x-csrf-token` header (middleware/csrf.js). The interceptor does that
+// automatically for mutating methods so the SPA stays protected with zero
+// per-call boilerplate (#801).
+const CSRF_COOKIE_NAME = 'cp_csrf';
+const CSRF_HEADER_NAME = 'x-csrf-token';
+const CSRF_MUTATING_METHODS = new Set(['post', 'put', 'patch', 'delete']);
+
+function readCookie(name) {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+apiClient.interceptors.request.use((config) => {
+  if (CSRF_MUTATING_METHODS.has(String(config.method || '').toLowerCase())) {
+    const csrfToken = readCookie(CSRF_COOKIE_NAME);
+    if (csrfToken) {
+      config.headers[CSRF_HEADER_NAME] = csrfToken;
+    }
+  }
+  return config;
+});
+
 // --- Offline retry queue ---
 // Idempotent GET requests that fail with a network error while the app is
 // offline are queued here and replayed when connectivity returns
@@ -29,7 +55,7 @@ apiClient.interceptors.response.use(
       config._retried = true;
       retryQueue.push(() => apiClient.request(config));
     }
-    return Promise.reject(error);
+    return Promise.reject(normalizeError(error));
   }
 );
 
@@ -41,7 +67,87 @@ export function retryQueuedRequests() {
   }
 }
 
+function normalizeError(error) {
+  if (error?.response?.data?.error) {
+    const e = error.response.data.error;
+    return { status: error.response.status, message: e.message, code: e.code, fields: e.fields };
+  }
+  return { status: error?.response?.status || 0, message: error.message || 'Network error' };
+}
+
 export const api = {
+  async getMe() {
+    const res = await apiClient.get('/users/me');
+    return res.data;
+  },
+  async login(email, password) {
+    const res = await apiClient.post('/auth/login', { email, password });
+    return res.data;
+  },
+  async login2FA(data) {
+    const res = await apiClient.post('/auth/2fa/challenge', data);
+    return res.data;
+  },
+  async register(data) {
+    const res = await apiClient.post('/auth/register', data);
+    return res.data;
+  },
+  async logout() {
+    const res = await apiClient.post('/auth/logout');
+    return res.data;
+  },
+  async forgotPassword(data) {
+    const res = await apiClient.post('/auth/forgot-password', data);
+    return res.data;
+  },
+  async resetPassword(data) {
+    const res = await apiClient.post('/auth/reset-password', data);
+    return res.data;
+  },
+  async adminExitImpersonation() {
+    const res = await apiClient.post('/admin/impersonate/exit');
+    return res.data;
+  },
+  async adminImpersonateUser(userId) {
+    const res = await apiClient.post(`/admin/impersonate/${userId}`);
+    return res.data;
+  },
+  async adminSuspendCampaign(id, data) {
+    const res = await apiClient.patch(`/admin/campaigns/${id}/suspend`, data);
+    return res.data;
+  },
+  async getContributions(campaignId, params) {
+    const res = await apiClient.get(`/campaigns/${campaignId}/backers`, { params });
+    return res.data;
+  },
+  async getCampaignRequirements(campaignId) {
+    const res = await apiClient.get(`/campaigns/${campaignId}/requirements`);
+    return res.data;
+  },
+  async setCampaignRequirements(campaignId, data) {
+    const res = await apiClient.post(`/campaigns/${campaignId}/requirements`, data);
+    return res.data;
+  },
+  async approveMilestone(id) {
+    const res = await apiClient.post(`/milestones/${id}/approve`);
+    return res.data;
+  },
+  async rejectMilestone(id, data) {
+    const res = await apiClient.post(`/milestones/${id}/reject`, data);
+    return res.data;
+  },
+  async voteMilestone(id, data) {
+    const res = await apiClient.post(`/milestones/${id}/votes`, data);
+    return res.data;
+  },
+  async submitMilestoneEvidence(id, formData) {
+    const res = await apiClient.post(`/milestones/${id}/upload-evidence`, formData);
+    return res.data;
+  },
+  async getMilestones(campaignId) {
+    const res = await apiClient.get(`/milestones/campaign/${campaignId}`);
+    return res.data;
+  },
   async getPlatformConfig() {
     const res = await apiClient.get('/governance/fee');
     return res.data;
@@ -181,6 +287,10 @@ export const api = {
     const res = await apiClient.get('/users/me/badges');
     return res.data;
   },
+  async updateMyProfile(data) {
+    const res = await apiClient.patch('/users/me', data);
+    return res.data;
+  },
   async getMyNftRewards() {
     const res = await apiClient.get('/users/me/nft-rewards');
     return res.data;
@@ -220,6 +330,96 @@ export const api = {
   },
   async submitPool(poolId) {
     const res = await apiClient.post(`/campaign-pools/${poolId}/submit`);
+    return res.data;
+  },
+
+  // --- Contributions (#688: preview-backed cross-asset flow) ---
+  async previewContribution(campaignId, { send_asset, amount }) {
+    const res = await apiClient.post(`/campaigns/${campaignId}/contribution/preview`, {
+      send_asset,
+      amount,
+    });
+    return res.data;
+  },
+  async quoteContribution(campaignId, { send_asset, dest_amount }) {
+    const res = await apiClient.post(`/campaigns/${campaignId}/contribution/preview`, {
+      send_asset,
+      amount: dest_amount,
+    });
+    return res.data;
+  },
+  async contribute(payload, referralQuery) {
+    const config = referralQuery?.query ? { params: referralQuery.query } : undefined;
+    const res = await apiClient.post('/contributions', payload, config);
+    return res.data;
+  },
+  async prepareContribution(payload, referralQuery) {
+    const config = referralQuery?.query ? { params: referralQuery.query } : undefined;
+    const res = await apiClient.post('/contributions/prepare', payload, config);
+    return res.data;
+  },
+  async submitSignedContribution(payload) {
+    const res = await apiClient.post('/contributions/submit-signed', payload);
+    return res.data;
+  },
+  async getContributions(campaignId, params) {
+    const res = await apiClient.get(`/contributions/campaign/${campaignId}`, { params });
+    return res.data;
+  },
+  async getContributionDiagnosis(contributionId) {
+    const res = await apiClient.get(`/contributions/${contributionId}/diagnosis`);
+    return res.data;
+  },
+  async getAnchorInfo() {
+    const res = await apiClient.get('/anchor/info');
+    return res.data;
+  },
+  async startAnchorDeposit(payload) {
+    const res = await apiClient.post('/anchor/deposits/start', payload);
+    return res.data;
+  },
+  async getAnchorDepositStatus(depositId) {
+    const res = await apiClient.get(`/anchor/deposits/${depositId}`);
+    return res.data;
+  },
+  async getContributionFinalization(txHash) {
+    const res = await apiClient.get(`/contributions/finalization/${txHash}`);
+    return res.data;
+  },
+
+  // --- Governance (#801: mutating calls moved onto the shared client so the
+  // CSRF header is attached and session cookies are used instead of a
+  // localStorage token that no longer exists) ---
+  async getGovernanceFee() {
+    const res = await apiClient.get('/governance/fee');
+    return res.data;
+  },
+  async getGovernanceProposals() {
+    const res = await apiClient.get('/governance/proposals');
+    return res.data;
+  },
+  async getGovernanceUserTokenBalance() {
+    const res = await apiClient.get('/governance/user/token-balance');
+    return res.data;
+  },
+  async getGovernanceProposal(id) {
+    const res = await apiClient.get(`/governance/proposals/${id}`);
+    return res.data;
+  },
+  async createGovernanceProposal(data) {
+    const res = await apiClient.post('/governance/proposals', data);
+    return res.data;
+  },
+  async voteGovernanceProposal(proposalId, inFavor) {
+    const res = await apiClient.post(`/governance/proposals/${proposalId}/vote`, { in_favor: inFavor });
+    return res.data;
+  },
+  async executeGovernanceProposal(proposalId) {
+    const res = await apiClient.post(`/governance/proposals/${proposalId}/execute`);
+    return res.data;
+  },
+  async submitSignedGovernance(url, prepareToken, signedXdr) {
+    const res = await apiClient.post(url, { prepare_token: prepareToken, signed_xdr: signedXdr });
     return res.data;
   },
 };

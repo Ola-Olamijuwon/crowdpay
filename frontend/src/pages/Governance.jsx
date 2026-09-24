@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { getNetwork, signTransaction } from '@stellar/freighter-api';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
+import { api } from '../services/api';
 import Navbar from '../components/Navbar';
 
 /**
@@ -10,9 +11,10 @@ import Navbar from '../components/Navbar';
  * inline (custodial) or hands back { mode: 'prepare', unsigned_xdr,
  * prepare_token } for a Freighter wallet to sign in the browser (#802).
  * This helper completes the Freighter leg when needed and returns the final
- * response body either way.
+ * response body either way. The signed submission runs through the shared
+ * API client so CSRF + session cookies are handled automatically (#801).
  */
-async function completeGovernanceAction(prepareResponse, submitSignedUrl, token) {
+async function completeGovernanceAction(prepareResponse, submitSignedUrl) {
   if (prepareResponse.mode !== 'prepare') {
     return prepareResponse;
   }
@@ -26,24 +28,11 @@ async function completeGovernanceAction(prepareResponse, submitSignedUrl, token)
   if (signed?.error) throw new Error(signed.error?.message || 'Freighter signing failed');
   if (!signed?.signedTxXdr) throw new Error('Freighter did not return a signed transaction');
 
-  const response = await fetch(submitSignedUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      prepare_token: prepareResponse.prepare_token,
-      signed_xdr: signed.signedTxXdr,
-    }),
-  });
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to submit signed transaction');
-  }
-
-  return response.json();
+  return api.submitSignedGovernance(
+    submitSignedUrl,
+    prepareResponse.prepare_token,
+    signed.signedTxXdr
+  );
 }
 
 export default function Governance() {
@@ -70,33 +59,25 @@ export default function Governance() {
   const loadGovernanceData = async () => {
     try {
       setLoading(true);
-      
+
       // Load fee info
-      const feeResponse = await fetch('/api/governance/fee');
-      const feeData = await feeResponse.json();
+      const feeData = await api.getGovernanceFee();
       setFeeInfo(feeData);
 
       // Load proposals
-      const proposalsResponse = await fetch('/api/governance/proposals');
-      const proposalsData = await proposalsResponse.json();
+      const proposalsData = await api.getGovernanceProposals();
       setProposals(proposalsData.proposals || []);
 
       // Load active proposal
       if (user) {
-        const balanceResponse = await fetch('/api/governance/user/token-balance', {
-          headers: {
-            'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          },
-        });
-        const balanceData = await balanceResponse.json();
+        const balanceData = await api.getGovernanceUserTokenBalance();
         setUserTokenBalance(balanceData);
       }
 
       // Check for active proposal
       const active = proposalsData.proposals?.find(p => p.status === 'active');
       if (active) {
-        const detailResponse = await fetch(`/api/governance/proposals/${active.id}`);
-        const detailData = await detailResponse.json();
+        const detailData = await api.getGovernanceProposal(active.id);
         setActiveProposal(detailData.proposal);
       }
     } catch (error) {
@@ -109,24 +90,11 @@ export default function Governance() {
 
   const handleCreateProposal = async (e) => {
     e.preventDefault();
-    const token = localStorage.getItem('token');
 
     try {
-      const response = await fetch('/api/governance/proposals', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify(newProposal),
-      });
+      const data = await api.createGovernanceProposal(newProposal);
 
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to create proposal');
-      }
-
-      await completeGovernanceAction(await response.json(), '/api/governance/proposals/submit-signed', token);
+      await completeGovernanceAction(data, '/api/governance/proposals/submit-signed');
 
       showToast('Proposal created successfully', 'success');
       setShowCreateForm(false);
@@ -143,29 +111,15 @@ export default function Governance() {
 
   const handleVote = async (inFavor) => {
     if (!activeProposal || !user) return;
-    const token = localStorage.getItem('token');
 
     try {
       setVoting(true);
 
-      const response = await fetch(`/api/governance/proposals/${activeProposal.id}/vote`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ in_favor: inFavor }),
-      });
-
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to vote');
-      }
+      const data = await api.voteGovernanceProposal(activeProposal.id, inFavor);
 
       await completeGovernanceAction(
-        await response.json(),
-        `/api/governance/proposals/${activeProposal.id}/vote/submit-signed`,
-        token
+        data,
+        `/api/governance/proposals/${activeProposal.id}/vote/submit-signed`
       );
 
       showToast('Vote recorded successfully', 'success');
@@ -181,18 +135,7 @@ export default function Governance() {
     if (!activeProposal) return;
 
     try {
-      const response = await fetch(`/api/governance/proposals/${activeProposal.id}/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-        },
-      });
-
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to execute proposal');
-      }
+      await api.executeGovernanceProposal(activeProposal.id);
 
       showToast('Proposal executed successfully', 'success');
       loadGovernanceData();

@@ -71,9 +71,10 @@
       </select>
       <button type="submit" class="btn-contribute" id="submitBtn">Contribute</button>
     </form>
+    <a id="externalContribute" class="btn-contribute" style="display:none; text-align:center; text-decoration:none; margin-top:10px;" target="_blank" rel="noopener noreferrer">Contribute on CrowdPay</a>
 
     <div class="celebration" id="celebration">
-      🎉 Contribution Confirmed! Thank you!
+      Contribution Confirmed! Thank you!
     </div>
   </div>
 
@@ -175,7 +176,21 @@
           });
 
           if (!res.ok) {
-            const errData = await res.json();
+            const errData = await res.json().catch(() => ({}));
+            if (errData.code === 'EMBED_PAYMENT_REQUIRED') {
+              const form = document.getElementById('contribForm');
+              const external = document.getElementById('externalContribute');
+              if (form) form.style.display = 'none';
+              if (external) {
+                external.href = errData.contribution_url || `/campaigns/${campaignId}`;
+                external.style.display = 'block';
+              }
+              notifyParent('CROWDPAY_CONTRIBUTION_REQUIRES_APP', {
+                contribution_url: errData.contribution_url,
+              });
+              sendResize();
+              return;
+            }
             alert(errData.error || 'Contribution failed');
             submitBtn.disabled = false;
             submitBtn.textContent = 'Contribute';
@@ -183,6 +198,16 @@
           }
 
           const result = await res.json();
+
+          // Do not celebrate simulated/unconfirmed payments as real funding
+          if (!result.txHash || result.simulated) {
+            if (result.simulated) {
+              alert('Simulation only — funds were not submitted on-chain.');
+            }
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Contribute';
+            return;
+          }
 
           // Optimistic UI Update
           if (campaignData) {

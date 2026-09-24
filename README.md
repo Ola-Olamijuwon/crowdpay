@@ -66,8 +66,8 @@ crowdpay/
 │   │   ├── middleware/      # auth, validation, error handler, request ID
 │   │   └── index.js         # Express app entry point
 │   └── db/
-│       ├── schema.sql       # base schema
-│       ├── migrate.js       # migration runner
+│       ├── schema.sql       # canonical base schema (matches migrations, see Feature Flags)
+│       ├── migrate.js       # migration runner (--bootstrap-schema for the fresh flow)
 │       └── migrations/      # date-prefixed SQL files
 ├── frontend/
 │   └── src/
@@ -228,6 +228,14 @@ CrowdPay supports runtime feature flags stored in PostgreSQL. This lets the team
 ### Database schema
 
 Migration: `backend/db/migrations/20260906_feature_flags.sql`
+
+`backend/db/schema.sql` declares the same canonical table (`key` PK +
+`default_enabled`) so the two bootstrap paths agree. Local dev uses
+`npm run migrate:fresh` (`psql -f db/schema.sql` followed by `migrate up
+--bootstrap-schema`), which skips early migrations whose objects schema.sql
+already provides instead of failing on duplicate tables. A CI job
+(`backend/db/verify-schema-convergence.js`) guards against drift between the two
+paths (#800).
 
 | Column            | Type        | Description                          |
 |-------------------|-------------|--------------------------------------|

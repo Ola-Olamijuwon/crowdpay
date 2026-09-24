@@ -89,6 +89,12 @@ CREATE TABLE contributions (
   source_asset        TEXT,
   conversion_rate     NUMERIC(30, 15),
   path                JSONB,
+  path_hops           JSONB,
+  effective_rate      NUMERIC(30, 15),
+  slippage_bps        INTEGER,
+  send_max            NUMERIC(20, 7),
+  retry_count         INTEGER NOT NULL DEFAULT 0,
+  diagnosis           TEXT,
   tx_hash             TEXT UNIQUE NOT NULL,  -- deduplicate by Stellar transaction hash
   display_name        VARCHAR(50),
   refunded            BOOLEAN NOT NULL DEFAULT FALSE,
@@ -406,22 +412,26 @@ CREATE INDEX idx_campaign_referrals_campaign_id ON campaign_referrals(campaign_i
 CREATE UNIQUE INDEX idx_campaign_referrals_code ON campaign_referrals(referral_code);
 CREATE UNIQUE INDEX idx_campaign_referrals_user_campaign ON campaign_referrals(campaign_id, referrer_user_id);
 
--- Feature flags for gradual rollouts, A/B tests, and kill switches
+-- Feature flags for incremental rollouts.
+-- Canonical shape: mirrors db/migrations/20260906_feature_flags.sql and the
+-- queries in src/routes/featureFlags.js (key / default_enabled), so a database
+-- bootstrapped from schema.sql and one built purely from migrations converge
+-- to the same table definition, seed data, and indexes (#800).
 CREATE TABLE feature_flags (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name              TEXT UNIQUE NOT NULL,
-  description       TEXT NOT NULL DEFAULT '',
-  enabled           BOOLEAN NOT NULL DEFAULT false,
-  rollout_pct       INTEGER CHECK (rollout_pct >= 0 AND rollout_pct <= 100),
-  target_roles      TEXT[],
-  target_user_ids   UUID[],
-  variants          JSONB NOT NULL DEFAULT '{}',
-  created_at        TIMESTAMPTZ DEFAULT NOW(),
-  updated_at        TIMESTAMPTZ DEFAULT NOW()
+  key             TEXT PRIMARY KEY,
+  enabled         BOOLEAN NOT NULL DEFAULT FALSE,
+  default_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  description     TEXT,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX feature_flags_name_idx ON feature_flags (name);
-CREATE INDEX feature_flags_enabled_idx ON feature_flags (enabled) WHERE enabled = true;
+-- Default flags (mirrors the migration's seed so both bootstrap paths agree)
+INSERT INTO feature_flags (key, enabled, default_enabled, description) VALUES
+  ('new_campaign_ui', false, false, 'Redesigned campaign creation flow'),
+  ('embed_widget_v2', false, false, 'Next-generation embed widget'),
+  ('recurring_donations', false, false, 'Monthly recurring contribution option'),
+  ('nft_rewards_v2', false, false, 'Enhanced NFT reward mechanics')
+ON CONFLICT (key) DO NOTHING;
 
 -- Failed payment records for ledger monitor retry/dead-letter
 CREATE TABLE failed_payment_records (

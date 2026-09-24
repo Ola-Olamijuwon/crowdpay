@@ -7,8 +7,9 @@ const {
   getCampaignNftRewards,
   listNftRewardsForContribution,
   ensureNftRewardRecord,
-  markNftRewardMinted,
   markNftRewardFailed,
+  isNftMintConfigured,
+  assertContributionOwnedByUser,
 } = require('../services/nftRewardService');
 
 router.get('/me', requireAuth, asyncHandler(async (req, res) => {
@@ -22,11 +23,13 @@ router.get('/campaign/:campaignId', asyncHandler(async (req, res) => {
 }));
 
 router.get('/contributions/:contributionId', requireAuth, asyncHandler(async (req, res) => {
-  const { rows: contributionRows } = await db.query(
-    `SELECT id FROM contributions WHERE id = $1`,
-    [req.params.contributionId],
-  );
-  if (!contributionRows.length) return res.status(404).json({ error: 'Contribution not found' });
+  try {
+    await assertContributionOwnedByUser(req.params.contributionId, req.user.userId);
+  } catch (err) {
+    if (err.statusCode === 404) return res.status(404).json({ error: 'Contribution not found' });
+    if (err.statusCode === 403) return res.status(403).json({ error: 'Forbidden' });
+    throw err;
+  }
   const rewards = await listNftRewardsForContribution(req.params.contributionId);
   res.json({ rewards });
 }));
@@ -38,16 +41,52 @@ router.post('/claim', requireAuth, asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'campaign_id, reward_tier_id, and contribution_id are required' });
   }
 
-  const { rows: contribRows } = await db.query(
-    `SELECT id, campaign_id FROM contributions WHERE id = $1`,
-    [contribution_id]
+  let contribution;
+  try {
+    contribution = await assertContributionOwnedByUser(contribution_id, req.user.userId);
+  } catch (err) {
+    if (err.statusCode === 404) return res.status(404).json({ error: 'Contribution not found' });
+    if (err.statusCode === 403) {
+      return res.status(403).json({ error: 'You do not own this contribution' });
+    }
+    throw err;
+  }
+
+  if (contribution.campaign_id !== campaign_id) {
+    return res.status(400).json({ error: 'Contribution does not belong to the requested campaign' });
+  }
+
+  const { rows: tierRows } = await db.query(
+    `SELECT rt.id, rt.campaign_id,
+            EXISTS (
+              SELECT 1 FROM nft_rewards nr
+              WHERE nr.reward_tier_id = rt.id AND nr.contribution_id IS NULL
+            ) AS nft_enabled
+     FROM reward_tiers rt
+     WHERE rt.id = $1`,
+    [reward_tier_id]
   );
-  if (!contribRows.length) {
-    return res.status(404).json({ error: 'Contribution not found' });
+  if (!tierRows.length) {
+    return res.status(404).json({ error: 'Reward tier not found' });
+  }
+  if (tierRows[0].campaign_id !== campaign_id) {
+    return res.status(400).json({ error: 'Reward tier does not belong to the requested campaign' });
+  }
+  if (!tierRows[0].nft_enabled) {
+    return res.status(400).json({ error: 'Reward tier does not offer NFT rewards' });
+  }
+
+  if (!isNftMintConfigured()) {
+    return res.status(503).json({
+      error: 'NFT rewards unavailable until an NFT contract is configured',
+      code: 'NFT_MINT_UNAVAILABLE',
+    });
   }
 
   const { rows: existingRows } = await db.query(
-    `SELECT id, status, token_id, tx_hash, serial_number FROM nft_rewards WHERE reward_tier_id = $1 AND contribution_id = $2`,
+    `SELECT id, status, token_id, tx_hash, serial_number, contract_id
+     FROM nft_rewards
+     WHERE reward_tier_id = $1 AND contribution_id = $2`,
     [reward_tier_id, contribution_id]
   );
 
@@ -56,52 +95,24 @@ router.post('/claim', requireAuth, asyncHandler(async (req, res) => {
     if (reward.status === 'minted') {
       return res.status(400).json({ error: 'NFT reward already claimed and minted', reward });
     }
+    if (reward.status === 'quarantined') {
+      return res.status(409).json({
+        error: 'Previous mock mint was invalidated; reclaim once on-chain minting is available',
+        reward,
+      });
+    }
     if (reward.status === 'minting') {
       return res.status(409).json({ error: 'NFT minting is already in progress', reward });
     }
-    if (reward.status === 'failed') {
-      const pendingRecord = await ensureNftRewardRecord({
+  }
+
+  const record = existingRows.length
+    ? existingRows[0]
+    : await ensureNftRewardRecord({
         campaignId: campaign_id,
         rewardTierId: reward_tier_id,
         contributionId: contribution_id,
       });
-
-      try {
-        const mockTokenId = 'tok_' + Date.now();
-        const mockTxHash = 'hash_' + Date.now();
-        const mockSerialNumber = Math.floor(Math.random() * 1000) + 1;
-
-        await markNftRewardMinted({
-          rewardTierId: reward_tier_id,
-          contributionId: contribution_id,
-          tokenId: mockTokenId,
-          txHash: mockTxHash,
-          serialNumber: mockSerialNumber,
-        });
-
-        return res.json({
-          success: true,
-          status: 'minted',
-          token_id: mockTokenId,
-          tx_hash: mockTxHash,
-          serial_number: mockSerialNumber,
-        });
-      } catch (err) {
-        await markNftRewardFailed({
-          rewardTierId: reward_tier_id,
-          contributionId: contribution_id,
-          errorMessage: err.message,
-        });
-        return res.status(500).json({ error: 'Retry mint failed', details: err.message });
-      }
-    }
-  }
-
-  const record = await ensureNftRewardRecord({
-    campaignId: campaign_id,
-    rewardTierId: reward_tier_id,
-    contributionId: contribution_id,
-  });
 
   if (!record) {
     const { rows: conflictRows } = await db.query(
@@ -111,34 +122,18 @@ router.post('/claim', requireAuth, asyncHandler(async (req, res) => {
     return res.status(409).json({ error: 'NFT reward claim already initiated', reward: conflictRows[0] });
   }
 
-  try {
-    const mockTokenId = 'tok_' + Date.now();
-    const mockTxHash = 'hash_' + Date.now();
-    const mockSerialNumber = Math.floor(Math.random() * 1000) + 1;
+  // Contract is configured but no mint adapter is wired yet — leave as minting/failed,
+  // never invent token IDs or tx hashes (#815).
+  await markNftRewardFailed({
+    rewardTierId: reward_tier_id,
+    contributionId: contribution_id,
+    errorMessage: 'On-chain NFT mint adapter is not implemented for the configured contract',
+  });
 
-    await markNftRewardMinted({
-      rewardTierId: reward_tier_id,
-      contributionId: contribution_id,
-      tokenId: mockTokenId,
-      txHash: mockTxHash,
-      serialNumber: mockSerialNumber,
-    });
-
-    res.status(201).json({
-      success: true,
-      status: 'minted',
-      token_id: mockTokenId,
-      tx_hash: mockTxHash,
-      serial_number: mockSerialNumber,
-    });
-  } catch (err) {
-    await markNftRewardFailed({
-      rewardTierId: reward_tier_id,
-      contributionId: contribution_id,
-      errorMessage: err.message,
-    });
-    res.status(500).json({ error: 'Mint failed', details: err.message });
-  }
+  return res.status(503).json({
+    error: 'NFT minting is configured but the on-chain mint adapter is not available yet',
+    code: 'NFT_MINT_ADAPTER_UNAVAILABLE',
+  });
 }));
 
 module.exports = router;

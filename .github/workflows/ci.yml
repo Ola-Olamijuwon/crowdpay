@@ -68,6 +68,17 @@ jobs:
           DATABASE_URL: postgresql://postgres:password@localhost:5432/crowdpay_test
         run: npm run migrate
 
+      - name: Verify schema.sql and migrations converge (migrate:fresh flow)
+        working-directory: ./backend
+        env:
+          PGPASSWORD: password
+          DATABASE_URL_SCHEMA_CHECK: postgresql://postgres:password@localhost:5432/crowdpay_schema_check
+        run: |
+          createdb -h localhost -U postgres crowdpay_schema_check
+          DATABASE_URL="$DATABASE_URL_SCHEMA_CHECK" npm run migrate:fresh
+          DATABASE_URL="$DATABASE_URL_SCHEMA_CHECK" node db/verify-schema-convergence.js
+          dropdb -h localhost -U postgres crowdpay_schema_check
+
       - name: Run test suite
         working-directory: ./backend
         env:

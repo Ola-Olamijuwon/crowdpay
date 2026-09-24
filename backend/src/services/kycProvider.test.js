@@ -56,6 +56,25 @@ test('verifyPersonaWebhookSignature allows unsigned webhooks in test mode withou
   assert.strictEqual(verifyPersonaWebhookSignature('{}', null), true);
 });
 
+test('createKycSession fails closed when Persona keys are missing (#814)', async () => {
+  delete process.env.PERSONA_API_KEY;
+  delete process.env.PERSONA_TEMPLATE_ID;
+  process.env.KYC_PROVIDER = 'persona';
+  const { createKycSession } = loadProvider();
+  await assert.rejects(
+    () => createKycSession({ user: { id: 'u1', name: 'Test', email: 't@example.com' } }),
+    /Persona KYC is not configured/
+  );
+});
+
+test('createKycSession allows explicit dev provider (#814)', async () => {
+  process.env.KYC_PROVIDER = 'dev';
+  const { createKycSession } = loadProvider();
+  const session = await createKycSession({ user: { id: 'u1', name: 'Test', email: 't@example.com' } });
+  assert.strictEqual(session.provider, 'dev');
+  assert.ok(session.redirectUrl);
+});
+
 test('extractWebhookResult maps approved inquiry to verified', () => {
   const { extractWebhookResult } = loadProvider();
   const result = extractWebhookResult({

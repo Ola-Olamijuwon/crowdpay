@@ -9,6 +9,9 @@ function frontendBaseUrl() {
 }
 
 async function handleKycWebhook(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).set('Allow', 'POST').json({ error: 'Method not allowed' });
+  }
   try {
     const rawBody = req.body;
     const signatureHeader = req.headers['persona-signature'] || req.headers['Persona-Signature'];
