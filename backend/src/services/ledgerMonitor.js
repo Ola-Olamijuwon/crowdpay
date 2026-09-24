@@ -420,14 +420,20 @@ async function recordConfirmedContribution({
     const reservedTierId = submittedRows[0]?.metadata?.tier_id || null;
     const referralLinkId = submittedRows[0]?.metadata?.referral_link_id || null;
     const nftRewardRequested = submittedRows[0]?.metadata?.nft_reward === true;
+    const pathHops = submittedRows[0]?.metadata?.path_hops ?? null;
+    const effectiveRate = submittedRows[0]?.metadata?.effective_rate ?? null;
+    const slippageBps = submittedRows[0]?.metadata?.slippage_bps ?? null;
+    const sendMax = submittedRows[0]?.metadata?.send_max ?? null;
+    const retryCount = submittedRows[0]?.metadata?.retry_count ?? 0;
 
     const { rows: inserted } = await client.query(
       `INSERT INTO contributions
          (campaign_id, sender_public_key, amount, asset, anchor_id, anchor_transaction_id,
           anchor_asset, anchor_amount, payment_type, source_amount, source_asset,
           conversion_rate, path, tx_hash, platform_fee_amount, display_name, ip_address, device_fingerprint,
-          referral_link_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19)
+          referral_link_id, path_hops, effective_rate, slippage_bps, send_max, retry_count, diagnosis)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19,
+               $20, $21, $22, $23, $24, $25)
        RETURNING id`,
       [
         campaignId,
@@ -449,6 +455,12 @@ async function recordConfirmedContribution({
         ipAddress,
         deviceFingerprint,
         referralLinkId,
+        pathHops ? JSON.stringify(pathHops) : null,
+        effectiveRate,
+        slippageBps,
+        sendMax,
+        retryCount,
+        'completed',
       ],
     );
 

@@ -368,6 +368,33 @@ The `campaign_translations` table allows creators to provide campaign descriptio
 
 **Unique constraint:** `(campaign_id, language)` — one translation per language per campaign.
 
-## Tables Not Found in Reviewed Migrations
+## Feature Flags (#800)
 
-The original documentation request referenced `api_keys` and `feature_flags`/`feature_flag_assignments` tables. These were not located in the migrations reviewed for this update — they may not exist yet, may be planned for a future migration, or may live under different table names. Flagging for a maintainer to confirm rather than guessing at their structure.
+The `feature_flags` table backs the runtime flag endpoints in
+`backend/src/routes/featureFlags.js`. Its canonical shape is declared both in
+the migration `backend/db/migrations/20260906_feature_flags.sql` and in
+`backend/db/schema.sql`, which now match so `migrate:fresh` converges.
+
+| Column            | Type            | Description                               |
+|-------------------|-----------------|-------------------------------------------|
+| key               | TEXT (PK)       | Flag identifier (kebab-case)              |
+| enabled           | BOOLEAN         | Runtime state                             |
+| default_enabled   | BOOLEAN         | Fallback when row is absent               |
+| description       | TEXT            | Human-readable purpose                    |
+| updated_at        | TIMESTAMPTZ     | Last modification time                    |
+
+## API Keys
+
+| Column       | Type             | Description                              |
+|--------------|------------------|------------------------------------------|
+| id           | UUID (PK)        | Unique key record id                     |
+| user_id      | UUID (FK)        | Owning user (CASCADE)                    |
+| key_prefix   | TEXT             | Short public prefix for identification   |
+| key_hash     | TEXT (UNIQUE)    | Hash of the secret key (never stored)    |
+| label        | TEXT             | Human-readable label                    |
+| scopes       | TEXT[]           | Allowed scopes (read/write/withdrawals)  |
+| last_used_at | TIMESTAMPTZ      | Last successful authenticated call       |
+| revoked_at   | TIMESTAMPTZ      | Non-null once revoked                    |
+| created_at   | TIMESTAMPTZ      | Creation timestamp                       |
+
+**Partial index:** `api_keys_user_active_idx ON api_keys (user_id) WHERE revoked_at IS NULL`.

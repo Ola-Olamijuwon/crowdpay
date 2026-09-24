@@ -13,7 +13,7 @@
     "migrate:up": "node db/migrate.js up",
     "migrate:status": "node db/migrate.js status",
     "migrate:down": "node db/migrate.js down",
-    "migrate:fresh": "psql $DATABASE_URL -f db/schema.sql && node db/migrate.js up",
+    "migrate:fresh": "psql $DATABASE_URL -f db/schema.sql && node db/migrate.js up --bootstrap-schema",
     "rotate-wallet-secrets": "node src/scripts/rotateWalletSecrets.js"
   },
   "dependencies": {

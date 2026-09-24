@@ -46,6 +46,14 @@ export default function OpsCenter() {
         'ops_api_key': apiKey,
         ...options.headers,
       };
+      // OpsCenter is API-key authenticated, but same-origin browsers still
+      // carry the `cp_csrf` cookie, so mutating requests must echo it in the
+      // x-csrf-token header or the global csrfProtection middleware rejects
+      // them with 403 (#801).
+      if (options.method && options.method.toUpperCase() !== 'GET' && typeof document !== 'undefined') {
+        const match = document.cookie.match(/(?:^|; )cp_csrf=([^;]*)/);
+        if (match) headers['x-csrf-token'] = decodeURIComponent(match[1]);
+      }
       const res = await fetch(url, { ...options, headers });
       if (res.status === 401) {
         throw new Error('UNAUTHORIZED_OPS');
